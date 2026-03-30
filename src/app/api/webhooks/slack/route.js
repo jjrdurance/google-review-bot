@@ -2,12 +2,12 @@ import crypto from 'crypto'
 import { WebClient } from '@slack/web-api'
 import { supabase } from '@/lib/supabase.js'
 import { publishReply } from '@/lib/publisher.js'
+import { updateSlackMessage, updateDailySummary } from '@/lib/plugins/slack.js'
 
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN)
 
 // ---------------------------------------------------------------------------
 // Slack request verification (HMAC-SHA256)
-// https://api.slack.com/authentication/verifying-requests-from-slack
 // ---------------------------------------------------------------------------
 async function verifySlackRequest(request, rawBody) {
   const timestamp = request.headers.get('x-slack-request-timestamp')
@@ -26,30 +26,19 @@ async function verifySlackRequest(request, rawBody) {
   return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(slackSignature))
 }
 
-// ---------------------------------------------------------------------------
-// Helpers to update the original Slack message after an action
-// ---------------------------------------------------------------------------
-async function replaceMessage(responseUrl, text) {
+// Fallback for error messages that can't use chat.update (no ts available)
+async function postEphemeralError(responseUrl, message) {
   await fetch(responseUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      replace_original: true,
-      text,
-      blocks: [
-        {
-          type: 'section',
-          text: { type: 'mrkdwn', text },
-        },
-      ],
-    }),
+    body: JSON.stringify({ replace_original: false, text: `⚠️ ${message}` }),
   })
 }
 
 // ---------------------------------------------------------------------------
 // Action handlers
 // ---------------------------------------------------------------------------
-async function handleApprove(reviewDbId, responseUrl) {
+async function handleApprove(reviewDbId) {
   const { error } = await supabase
     .from('reviews')
     .update({ status: 'approved', approved_at: new Date().toISOString() })
@@ -58,10 +47,11 @@ async function handleApprove(reviewDbId, responseUrl) {
   if (error) throw new Error(`Supabase update failed: ${error.message}`)
 
   await publishReply(reviewDbId)
-  await replaceMessage(responseUrl, '✅ Reply approved and posted to Google.')
+  await updateSlackMessage(reviewDbId)
+  await updateDailySummary(reviewDbId)
 }
 
-async function handleReject(reviewDbId, responseUrl) {
+async function handleReject(reviewDbId) {
   const { error } = await supabase
     .from('reviews')
     .update({ status: 'rejected' })
@@ -69,7 +59,8 @@ async function handleReject(reviewDbId, responseUrl) {
 
   if (error) throw new Error(`Supabase update failed: ${error.message}`)
 
-  await replaceMessage(responseUrl, '❌ Reply rejected.')
+  await updateSlackMessage(reviewDbId)
+  await updateDailySummary(reviewDbId)
 }
 
 async function handleEdit(reviewDbId, triggerId) {
@@ -123,6 +114,8 @@ async function handleModalSubmit(payload) {
   if (error) throw new Error(`Supabase update failed: ${error.message}`)
 
   await publishReply(reviewDbId)
+  await updateSlackMessage(reviewDbId)
+  await updateDailySummary(reviewDbId)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,12 +129,9 @@ export async function POST(request) {
     return new Response('Unauthorized', { status: 401 })
   }
 
-  // Slack sends URL-encoded body with a "payload" field containing JSON
   const params = new URLSearchParams(rawBody)
   const payload = JSON.parse(params.get('payload'))
 
-  // Respond to Slack immediately — must reply within 3 seconds
-  // All async work runs after this response is returned
   const responseUrl = payload.response_url
   const triggerId = payload.trigger_id
 
@@ -152,15 +142,15 @@ export async function POST(request) {
     setImmediate(async () => {
       try {
         if (action.action_id === 'approve_reply') {
-          await handleApprove(reviewDbId, responseUrl)
+          await handleApprove(reviewDbId)
         } else if (action.action_id === 'reject_reply') {
-          await handleReject(reviewDbId, responseUrl)
+          await handleReject(reviewDbId)
         } else if (action.action_id === 'edit_reply') {
           await handleEdit(reviewDbId, triggerId)
         }
       } catch (err) {
         console.error('[slack webhook] Action handler error:', err.message)
-        if (responseUrl) await replaceMessage(responseUrl, `⚠️ Something went wrong: ${err.message}`)
+        if (responseUrl) await postEphemeralError(responseUrl, err.message)
       }
     })
   }

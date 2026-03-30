@@ -4,7 +4,21 @@ import { useEffect, useState } from 'react'
 import { supabase } from '@/lib/supabase.js'
 import { publishReply } from '@/lib/publisher.js'
 
-const TABS = ['pending', 'approved', 'rejected']
+const TABS = ['pending', 'posted', 'rejected', 'failed']
+
+const TAB_LABELS = {
+  pending: 'Pending',
+  posted: 'Approved & Posted',
+  rejected: 'Rejected',
+  failed: 'Failed',
+}
+
+const TAB_STATUSES = {
+  pending: 'pending',
+  posted: 'posted',
+  rejected: 'rejected',
+  failed: 'notification_failed',
+}
 
 function Stars({ rating }) {
   return (
@@ -17,9 +31,10 @@ function Stars({ rating }) {
 
 function EmptyState({ status }) {
   const messages = {
-    pending: 'No pending reviews. You\'re all caught up!',
-    approved: 'No approved reviews yet.',
+    pending: "No pending reviews. You're all caught up!",
+    posted: 'No approved replies posted yet.',
     rejected: 'No rejected reviews.',
+    failed: 'No failed notifications.',
   }
   return (
     <div className="text-center py-16 text-gray-400">
@@ -34,6 +49,14 @@ function ReviewCard({ review, onAction }) {
   const [editText, setEditText] = useState(review.ai_reply)
   const [loading, setLoading] = useState(false)
 
+  async function notifySlack() {
+    await fetch('/api/reviews/update-slack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewDbId: review.id }),
+    })
+  }
+
   async function handleApprove(replyText = null) {
     setLoading(true)
     try {
@@ -45,6 +68,7 @@ function ReviewCard({ review, onAction }) {
         .update({ status: 'approved', approved_at: new Date().toISOString() })
         .eq('id', review.id)
       await publishReply(review.id)
+      await notifySlack()
       onAction()
     } finally {
       setLoading(false)
@@ -55,6 +79,7 @@ function ReviewCard({ review, onAction }) {
     setLoading(true)
     try {
       await supabase.from('reviews').update({ status: 'rejected' }).eq('id', review.id)
+      await notifySlack()
       onAction()
     } finally {
       setLoading(false)
@@ -162,10 +187,13 @@ export default function DashboardPage() {
   const [reviews, setReviews] = useState([])
   const [activeTab, setActiveTab] = useState('pending')
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState(null)
+  const [lastUpdated, setLastUpdated] = useState(null)
 
-  async function fetchReviews() {
-    setLoading(true)
+  async function fetchReviews({ silent = false } = {}) {
+    if (!silent) setLoading(true)
+    else setRefreshing(true)
     setError(null)
     const { data, error } = await supabase
       .from('reviews')
@@ -176,20 +204,29 @@ export default function DashboardPage() {
       setError('Failed to load reviews.')
     } else {
       setReviews(data)
+      setLastUpdated(new Date())
     }
     setLoading(false)
+    setRefreshing(false)
   }
 
+  // Initial load
   useEffect(() => {
     fetchReviews()
   }, [])
 
+  // Auto-poll every 10 seconds
+  useEffect(() => {
+    const interval = setInterval(() => fetchReviews({ silent: true }), 10000)
+    return () => clearInterval(interval)
+  }, [])
+
   const counts = TABS.reduce((acc, tab) => {
-    acc[tab] = reviews.filter((r) => r.status === tab).length
+    acc[tab] = reviews.filter((r) => r.status === TAB_STATUSES[tab]).length
     return acc
   }, {})
 
-  const filtered = reviews.filter((r) => r.status === activeTab)
+  const filtered = reviews.filter((r) => r.status === TAB_STATUSES[activeTab])
 
   const tabStyles = (tab) =>
     `px-4 py-2 rounded-full text-sm font-medium transition-colors ` +
@@ -202,18 +239,36 @@ export default function DashboardPage() {
       <div className="max-w-3xl mx-auto px-4 py-8 sm:py-12">
 
         {/* Header */}
-        <div className="mb-8">
-          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 tracking-tight">
-            GroundLevel AI
-          </h1>
-          <p className="text-gray-500 mt-1">Review Dashboard</p>
+        <div className="flex items-start justify-between gap-4 mb-8">
+          <div>
+            <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 tracking-tight">
+              GroundLevel AI
+            </h1>
+            <p className="text-gray-500 mt-1">
+              Review Dashboard
+              {lastUpdated && (
+                <span className="ml-2 text-xs text-gray-400">
+                  · updated {lastUpdated.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' })}
+                </span>
+              )}
+            </p>
+          </div>
+          <button
+            onClick={() => fetchReviews({ silent: true })}
+            disabled={refreshing || loading}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-medium disabled:opacity-50 transition-colors mt-1"
+            title="Refresh"
+          >
+            <span className={refreshing ? 'animate-spin inline-block' : 'inline-block'}>↻</span>
+            <span className="hidden sm:inline">Refresh</span>
+          </button>
         </div>
 
         {/* Tabs */}
         <div className="flex gap-2 flex-wrap mb-6">
           {TABS.map((tab) => (
-            <button key={tab} onClick={() => setActiveTab(tab)} className={tabStyles(tab)}>
-              {tab.charAt(0).toUpperCase() + tab.slice(1)}
+            <button key={tab} onClick={() => { setActiveTab(tab); fetchReviews({ silent: true }) }} className={tabStyles(tab)}>
+              {TAB_LABELS[tab]}
               {counts[tab] > 0 && (
                 <span className={`ml-2 text-xs px-1.5 py-0.5 rounded-full font-semibold ` +
                   (activeTab === tab ? 'bg-white text-gray-900' : 'bg-gray-300 text-gray-700')}>
